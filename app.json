@@ -9,7 +9,10 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.orchat.app"
+      "bundleIdentifier": "com.orchat.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.orchat.app",
@@ -26,6 +29,12 @@
     "plugins": [
       "expo-secure-store",
       "expo-web-browser"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "3ed00403-9bc9-4f69-82ba-2e078284ace5"
+      }
+    },
+    "owner": "gertk99"
   }
 }
