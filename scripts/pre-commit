@@ -1,0 +1,7 @@
+#!/bin/bash
+# Pre-commit hook: run the Jest unit test suite before allowing a commit.
+# Installed via scripts/install-hooks.sh -> copies this into .git/hooks/pre-commit.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+echo "Running unit tests before commit..."
+npx jest --silent
