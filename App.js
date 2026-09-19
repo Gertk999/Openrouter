@@ -28,6 +28,8 @@ import {
   sortModelsByName,
   buildMessageContent,
   toggleModelSelection,
+  filterModelsForAttachments,
+  hasImageAttachment,
 } from './lib/utils';
 
 const DEFAULT_MODEL = 'anthropic/claude-sonnet-5';
@@ -156,7 +158,8 @@ export default function App() {
     setSending(true);
     try {
       if (compareMode && compareModels.length >= 2) {
-        const results = await sendChatMulti(apiKey, compareModels, nextMessages);
+        const modelInfoById = Object.fromEntries(models.map((m) => [m.id, m]));
+        const results = await sendChatMulti(apiKey, compareModels, nextMessages, modelInfoById);
         setMessages((prev) => [
           ...prev,
           { id: Date.now() + '-cmp', role: 'compare', results },
@@ -355,7 +358,11 @@ export default function App() {
           <View style={styles.modalSheet}>
             <Text style={styles.modalTitle}>Choose a model</Text>
             <FlatList
-              data={models.length ? models : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }]}
+              data={
+                filterModelsForAttachments(models, attachments).length
+                  ? filterModelsForAttachments(models, attachments)
+                  : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }]
+              }
               keyExtractor={(m) => m.id}
               renderItem={({ item }) => (
                 <TouchableOpacity
@@ -379,8 +386,15 @@ export default function App() {
         <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setComparePickerVisible(false)}>
           <View style={styles.modalSheet}>
             <Text style={styles.modalTitle}>Compare up to {COMPARE_MODEL_CAP} models</Text>
+            {hasImageAttachment(attachments) && (
+              <Text style={styles.compareHintText}>Only showing models that support image input, since a photo is attached.</Text>
+            )}
             <FlatList
-              data={models.length ? models : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }]}
+              data={
+                filterModelsForAttachments(models, attachments).length
+                  ? filterModelsForAttachments(models, attachments)
+                  : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }]
+              }
               keyExtractor={(m) => m.id}
               renderItem={({ item }) => {
                 const idx = compareModels.indexOf(item.id);
@@ -461,10 +475,11 @@ const styles = StyleSheet.create({
   attachmentThumb: { width: 80, height: 80, borderRadius: 10 },
   typingRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingBottom: 8 },
   typingText: { color: '#8e8e93', marginLeft: 8, fontSize: 13 },
-  compareRow: { flexDirection: 'column', marginBottom: 10, gap: 8 },
-  compareCard: { backgroundColor: CARD, borderRadius: 12, padding: 12, borderWidth: 1.5 },
+  compareRow: { flexDirection: 'row', marginBottom: 10, gap: 8 },
+  compareCard: { flex: 1, backgroundColor: CARD, borderRadius: 12, padding: 12, borderWidth: 1.5, minWidth: 0 },
   compareModelLabel: { fontSize: 12, fontWeight: '700', marginBottom: 6 },
   compareCardText: { color: '#fff', fontSize: 14, lineHeight: 20 },
+  compareHintText: { color: '#8e8e93', fontSize: 12, textAlign: 'center', marginBottom: 10, paddingHorizontal: 8 },
   attachmentBar: { paddingHorizontal: 12, paddingTop: 8 },
   attachmentChip: {
     flexDirection: 'row',

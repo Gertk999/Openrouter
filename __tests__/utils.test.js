@@ -1,4 +1,4 @@
-import { colorForIndex, sortModelsByName, buildMessageContent, canAddModel, toggleModelSelection, COMPARE_MODEL_CAP, COMPARE_COLORS } from '../lib/utils';
+import { colorForIndex, sortModelsByName, buildMessageContent, canAddModel, toggleModelSelection, COMPARE_MODEL_CAP, COMPARE_COLORS, modelSupportsVision, hasImageAttachment, filterModelsForAttachments, stripUnsupportedImages } from '../lib/utils';
 
 describe('colorForIndex', () => {
   it('returns the 3 fixed compare colors in order', () => {
@@ -97,5 +97,66 @@ describe('toggleModelSelection', () => {
 
   it('enforces the 3-model cap by default', () => {
     expect(toggleModelSelection(['a', 'b', 'c'], 'd')).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('modelSupportsVision', () => {
+  it('returns true when architecture.input_modalities includes image', () => {
+    expect(modelSupportsVision({ architecture: { input_modalities: ['text', 'image'] } })).toBe(true);
+  });
+
+  it('returns false when architecture.input_modalities excludes image', () => {
+    expect(modelSupportsVision({ architecture: { input_modalities: ['text'] } })).toBe(false);
+  });
+
+  it('fails open (assumes vision-capable) when architecture info is missing', () => {
+    expect(modelSupportsVision({ id: 'unknown-model' })).toBe(true);
+    expect(modelSupportsVision(undefined)).toBe(true);
+  });
+});
+
+describe('hasImageAttachment', () => {
+  it('detects an image attachment among mixed types', () => {
+    expect(hasImageAttachment([{ type: 'file' }, { type: 'image' }])).toBe(true);
+  });
+
+  it('returns false when there are no attachments or no images', () => {
+    expect(hasImageAttachment([])).toBe(false);
+    expect(hasImageAttachment([{ type: 'file' }])).toBe(false);
+  });
+});
+
+describe('filterModelsForAttachments', () => {
+  const vision = { id: 'vision-model', architecture: { input_modalities: ['text', 'image'] } };
+  const textOnly = { id: 'text-model', architecture: { input_modalities: ['text'] } };
+
+  it('returns the full list unchanged when there is no image attached', () => {
+    expect(filterModelsForAttachments([vision, textOnly], [])).toEqual([vision, textOnly]);
+  });
+
+  it('narrows to vision-capable models when an image is attached', () => {
+    expect(filterModelsForAttachments([vision, textOnly], [{ type: 'image' }])).toEqual([vision]);
+  });
+});
+
+describe('stripUnsupportedImages', () => {
+  const imageMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: 'look at this' }, { type: 'image_url', image_url: { url: 'data:...' } }],
+  };
+  const textMessage = { role: 'user', content: 'just text' };
+
+  it('leaves messages untouched when the model supports vision', () => {
+    expect(stripUnsupportedImages([imageMessage, textMessage], true)).toEqual([imageMessage, textMessage]);
+  });
+
+  it('replaces image parts with a text placeholder when the model lacks vision support', () => {
+    const result = stripUnsupportedImages([imageMessage, textMessage], false);
+    expect(result[0].content).toBe('look at this\n[image omitted — this model does not support image input]');
+    expect(result[1]).toEqual(textMessage);
+  });
+
+  it('does not error on plain-string content when stripping', () => {
+    expect(stripUnsupportedImages([textMessage], false)).toEqual([textMessage]);
   });
 });

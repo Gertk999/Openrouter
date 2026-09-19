@@ -75,4 +75,26 @@ describe('sendChatMulti', () => {
     expect(results[1].content).toBe('ok');
     expect(results[1].error).toBeNull();
   });
+
+  it('strips images from the request body for models that lack vision support', async () => {
+    const bodies = [];
+    global.fetch = jest.fn().mockImplementation((url, opts) => {
+      bodies.push(JSON.parse(opts.body));
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) });
+    });
+    const messages = [{
+      role: 'user',
+      content: [{ type: 'text', text: 'what is this' }, { type: 'image_url', image_url: { url: 'data:...' } }],
+    }];
+    const modelInfoById = {
+      'vision-model': { id: 'vision-model', architecture: { input_modalities: ['text', 'image'] } },
+      'text-model': { id: 'text-model', architecture: { input_modalities: ['text'] } },
+    };
+    await sendChatMulti('key', ['vision-model', 'text-model'], messages, modelInfoById);
+    const visionCallBody = bodies.find((b) => b.model === 'vision-model');
+    const textCallBody = bodies.find((b) => b.model === 'text-model');
+    expect(Array.isArray(visionCallBody.messages[0].content)).toBe(true);
+    expect(typeof textCallBody.messages[0].content).toBe('string');
+    expect(textCallBody.messages[0].content).toContain('image omitted');
+  });
 });
