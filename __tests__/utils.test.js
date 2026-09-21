@@ -1,4 +1,25 @@
-import { colorForIndex, sortModelsByName, buildMessageContent, canAddModel, toggleModelSelection, COMPARE_MODEL_CAP, COMPARE_COLORS, modelSupportsVision, hasImageAttachment, filterModelsForAttachments, stripUnsupportedImages } from '../lib/utils';
+import { colorForIndex, sortModelsByName, buildMessageContent, canAddModel, toggleModelSelection, COMPARE_MODEL_CAP, COMPARE_COLORS, modelSupportsVision, hasImageAttachment, filterModelsForAttachments, stripUnsupportedImages, toApiMessages } from '../lib/utils';
+
+describe('toApiMessages', () => {
+  it('keeps only user and assistant turns', () => {
+    const messages = [
+      { id: '1', role: 'user', content: 'hi' },
+      { id: '2', role: 'assistant', content: 'hello' },
+      { id: '3', role: 'compare', results: [{ model: 'x', content: 'y', error: null }] },
+      { id: '4', role: 'error', content: 'boom' },
+      { id: '5', role: 'user', content: 'again' },
+    ];
+    expect(toApiMessages(messages)).toEqual([
+      { id: '1', role: 'user', content: 'hi' },
+      { id: '2', role: 'assistant', content: 'hello' },
+      { id: '5', role: 'user', content: 'again' },
+    ]);
+  });
+
+  it('returns an empty array when there are no real turns', () => {
+    expect(toApiMessages([{ id: '1', role: 'compare', results: [] }])).toEqual([]);
+  });
+});
 
 describe('colorForIndex', () => {
   it('returns the 3 fixed compare colors in order', () => {

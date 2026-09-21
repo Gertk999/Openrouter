@@ -30,6 +30,7 @@ import {
   toggleModelSelection,
   filterModelsForAttachments,
   hasImageAttachment,
+  toApiMessages,
 } from './lib/utils';
 
 const DEFAULT_MODEL = 'anthropic/claude-sonnet-5';
@@ -159,13 +160,13 @@ export default function App() {
     try {
       if (compareMode && compareModels.length >= 2) {
         const modelInfoById = Object.fromEntries(models.map((m) => [m.id, m]));
-        const results = await sendChatMulti(apiKey, compareModels, nextMessages, modelInfoById);
+        const results = await sendChatMulti(apiKey, compareModels, toApiMessages(nextMessages), modelInfoById);
         setMessages((prev) => [
           ...prev,
           { id: Date.now() + '-cmp', role: 'compare', results },
         ]);
       } else {
-        const reply = await sendChat(apiKey, selectedModel, nextMessages);
+        const reply = await sendChat(apiKey, selectedModel, toApiMessages(nextMessages));
         setMessages((prev) => [...prev, { id: Date.now() + '-a', role: 'assistant', content: reply }]);
       }
     } catch (e) {
