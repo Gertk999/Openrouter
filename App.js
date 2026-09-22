@@ -23,6 +23,12 @@ import * as FileSystem from 'expo-file-system';
 import { startOpenRouterLogin, finishOpenRouterLogin, getStoredKey, logout } from './lib/auth';
 import { fetchModels, sendChat, sendChatMulti } from './lib/openrouter';
 import {
+  getOrCreateDeviceId,
+  fetchAnonModels,
+  fetchAnonStatus,
+  sendAnonChat,
+} from './lib/anon';
+import {
   COMPARE_COLORS,
   COMPARE_MODEL_CAP,
   sortModelsByName,
@@ -43,6 +49,14 @@ export default function App() {
 
   const [awaitingCode, setAwaitingCode] = useState(false);
   const [pastedCode, setPastedCode] = useState('');
+
+  // Anonymous free-trial tier: no OpenRouter account, chat goes through our
+  // backend proxy instead, capped at a lifetime $0.50 per device.
+  const [isAnon, setIsAnon] = useState(false);
+  const [anonDeviceId, setAnonDeviceId] = useState(null);
+  const [anonStatus, setAnonStatus] = useState(null); // { spend_usd, remaining_usd, locked }
+  const [anonStarting, setAnonStarting] = useState(false);
+  const [anonError, setAnonError] = useState(null);
 
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL);
@@ -70,11 +84,41 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!apiKey) return;
+    if (!apiKey || isAnon) return;
     fetchModels(apiKey)
       .then((m) => setModels(sortModelsByName(m)))
       .catch((e) => console.warn('model fetch failed', e.message));
-  }, [apiKey]);
+  }, [apiKey, isAnon]);
+
+  const refreshAnonStatus = useCallback(async (deviceId) => {
+    try {
+      const status = await fetchAnonStatus(deviceId);
+      setAnonStatus(status);
+    } catch (e) {
+      console.warn('anon status fetch failed', e.message);
+    }
+  }, []);
+
+  const handleTryFree = useCallback(async () => {
+    setAnonError(null);
+    setAnonStarting(true);
+    try {
+      const deviceId = await getOrCreateDeviceId();
+      setAnonDeviceId(deviceId);
+      const [anonModels] = await Promise.all([
+        fetchAnonModels(),
+        refreshAnonStatus(deviceId),
+      ]);
+      setModels(sortModelsByName(anonModels.map((id) => ({ id, name: id }))));
+      setSelectedModel(anonModels[0] || DEFAULT_MODEL);
+      setIsAnon(true);
+      setApiKey('anon'); // truthy sentinel -- unlocks the chat screen; never sent anywhere
+    } catch (e) {
+      setAnonError(e.message);
+    } finally {
+      setAnonStarting(false);
+    }
+  }, [refreshAnonStatus]);
 
   const handleLogin = useCallback(async () => {
     setLoginError(null);
@@ -107,6 +151,9 @@ export default function App() {
   const handleLogout = useCallback(async () => {
     await logout();
     setApiKey(null);
+    setIsAnon(false);
+    setAnonDeviceId(null);
+    setAnonStatus(null);
     setMessages([]);
   }, []);
 
@@ -150,6 +197,13 @@ export default function App() {
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if ((!text && attachments.length === 0) || sending) return;
+    if (isAnon && anonStatus?.locked) {
+      Alert.alert(
+        'Free trial used up',
+        'You\'ve used your free $0.50 trial. Sign in with your own OpenRouter account to keep chatting, or add credit.',
+      );
+      return;
+    }
     const content = buildMessageContent(text, attachments);
     const userMsg = { id: Date.now() + '-u', role: 'user', content, displayText: text, attachments };
     const nextMessages = [...messages, userMsg];
@@ -158,7 +212,11 @@ export default function App() {
     setAttachments([]);
     setSending(true);
     try {
-      if (compareMode && compareModels.length >= 2) {
+      if (isAnon) {
+        const reply = await sendAnonChat(anonDeviceId, selectedModel, toApiMessages(nextMessages));
+        setMessages((prev) => [...prev, { id: Date.now() + '-a', role: 'assistant', content: reply }]);
+        refreshAnonStatus(anonDeviceId);
+      } else if (compareMode && compareModels.length >= 2) {
         const modelInfoById = Object.fromEntries(models.map((m) => [m.id, m]));
         const results = await sendChatMulti(apiKey, compareModels, toApiMessages(nextMessages), modelInfoById);
         setMessages((prev) => [
@@ -170,6 +228,13 @@ export default function App() {
         setMessages((prev) => [...prev, { id: Date.now() + '-a', role: 'assistant', content: reply }]);
       }
     } catch (e) {
+      if (isAnon && e.status === 402) {
+        setAnonStatus((prev) => ({ ...(prev || {}), locked: true, remaining_usd: 0 }));
+        Alert.alert(
+          'Free trial used up',
+          'You\'ve used your free $0.50 trial. Sign in with your own OpenRouter account to keep chatting, or add credit.',
+        );
+      }
       setMessages((prev) => [
         ...prev,
         { id: Date.now() + '-e', role: 'error', content: e.message },
@@ -178,7 +243,7 @@ export default function App() {
       setSending(false);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
     }
-  }, [input, attachments, sending, messages, apiKey, selectedModel, compareMode, compareModels]);
+  }, [input, attachments, sending, messages, apiKey, selectedModel, compareMode, compareModels, isAnon, anonDeviceId, anonStatus, refreshAnonStatus]);
 
   const handleToggleCompareModel = useCallback((modelId) => {
     setCompareModels((prev) => toggleModelSelection(prev, modelId, COMPARE_MODEL_CAP));
@@ -199,9 +264,21 @@ export default function App() {
         <Text style={styles.logo}>OpenRouter Chat</Text>
         <Text style={styles.subtitle}>Sign in with your own OpenRouter account.{'\n'}No backend — your key stays on this device.</Text>
         {!awaitingCode ? (
-          <TouchableOpacity style={styles.loginButton} onPress={handleLogin} disabled={loggingIn}>
-            {loggingIn ? <ActivityIndicator color="#000" /> : <Text style={styles.loginButtonText}>Continue with OpenRouter</Text>}
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity style={styles.loginButton} onPress={handleLogin} disabled={loggingIn}>
+              {loggingIn ? <ActivityIndicator color="#000" /> : <Text style={styles.loginButtonText}>Continue with OpenRouter</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.loginButton, styles.tryFreeButton]}
+              onPress={handleTryFree}
+              disabled={anonStarting}
+            >
+              {anonStarting ? <ActivityIndicator color="#fff" /> : <Text style={styles.tryFreeButtonText}>Try free — no account needed</Text>}
+            </TouchableOpacity>
+            <Text style={[styles.subtitle, { marginTop: 8, fontSize: 12 }]}>
+              Free trial: $0.50 lifetime, limited models. No sign-up.
+            </Text>
+          </>
         ) : (
           <>
             <Text style={[styles.subtitle, { marginTop: 8 }]}>
@@ -225,6 +302,7 @@ export default function App() {
           </>
         )}
         {loginError ? <Text style={styles.errorText}>{loginError}</Text> : null}
+        {anonError ? <Text style={styles.errorText}>{anonError}</Text> : null}
       </SafeAreaView>
     );
   }
@@ -238,21 +316,27 @@ export default function App() {
           <Text style={styles.chevron}>▾</Text>
         </TouchableOpacity>
         <View style={styles.headerRight}>
-          <TouchableOpacity
-            style={[styles.compareButton, compareMode && styles.compareButtonActive]}
-            onPress={() => {
-              if (!compareMode) {
-                setComparePickerVisible(true);
-              } else {
-                setCompareMode(false);
-                setCompareModels([]);
-              }
-            }}
-          >
-            <Text style={[styles.compareButtonText, compareMode && styles.compareButtonTextActive]}>
-              {compareMode ? `Comparing (${compareModels.length})` : 'Compare'}
+          {isAnon ? (
+            <Text style={styles.anonBalanceText}>
+              ${(anonStatus?.remaining_usd ?? 0.5).toFixed(2)} free left
             </Text>
-          </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[styles.compareButton, compareMode && styles.compareButtonActive]}
+              onPress={() => {
+                if (!compareMode) {
+                  setComparePickerVisible(true);
+                } else {
+                  setCompareMode(false);
+                  setCompareModels([]);
+                }
+              }}
+            >
+              <Text style={[styles.compareButtonText, compareMode && styles.compareButtonTextActive]}>
+                {compareMode ? `Comparing (${compareModels.length})` : 'Compare'}
+              </Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity onPress={handleLogout}>
             <Text style={styles.logoutText}>Sign out</Text>
           </TouchableOpacity>
@@ -330,12 +414,16 @@ export default function App() {
           </ScrollView>
         )}
         <View style={styles.inputRow}>
-          <TouchableOpacity style={styles.attachButton} onPress={handlePickImage}>
-            <Text style={styles.attachButtonText}>📷</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.attachButton} onPress={handlePickFile}>
-            <Text style={styles.attachButtonText}>📎</Text>
-          </TouchableOpacity>
+          {!isAnon && (
+            <>
+              <TouchableOpacity style={styles.attachButton} onPress={handlePickImage}>
+                <Text style={styles.attachButtonText}>📷</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.attachButton} onPress={handlePickFile}>
+                <Text style={styles.attachButtonText}>📎</Text>
+              </TouchableOpacity>
+            </>
+          )}
           <TextInput
             style={styles.input}
             value={input}
@@ -443,6 +531,9 @@ const styles = StyleSheet.create({
   logo: { color: '#fff', fontSize: 28, fontWeight: '700', marginBottom: 12 },
   subtitle: { color: '#a1a1a6', fontSize: 15, textAlign: 'center', marginBottom: 32, lineHeight: 22 },
   loginButton: { backgroundColor: ACCENT, paddingVertical: 14, paddingHorizontal: 28, borderRadius: 24 },
+  tryFreeButton: { backgroundColor: 'transparent', borderWidth: 1, borderColor: '#3a3a3c', marginTop: 12 },
+  tryFreeButtonText: { color: '#fff', fontSize: 15, fontWeight: '600', textAlign: 'center' },
+  anonBalanceText: { color: '#8e8e93', fontSize: 13, fontWeight: '600' },
   codeInput: { backgroundColor: '#1a1a1a', color: '#fff', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 16, width: '100%', marginVertical: 16, borderWidth: 1, borderColor: '#333' },
   loginButtonText: { color: '#000', fontSize: 16, fontWeight: '600', textAlign: 'center' },
   errorText: { color: '#ff6b6b', marginTop: 16, textAlign: 'center' },
