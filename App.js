@@ -7,11 +7,12 @@ import {
   TouchableOpacity,
   FlatList,
   ScrollView,
+  Image,
+  Modal,
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
-  Modal,
-  Image,
+  Switch,
   StyleSheet,
   StatusBar,
   Alert,
@@ -38,6 +39,21 @@ import {
   hasImageAttachment,
   toApiMessages,
 } from './lib/utils';
+import {
+  FLAGSHIP_MODEL_IDS,
+  recordModelUsage,
+  getModelUsageCounts,
+  buildShortlist,
+  groupModelsByProvider,
+  filterModelsBySearch,
+  getModelPrefs,
+  saveModelPrefs,
+  rankModelsByPreference,
+} from './lib/modelPrefs';
+import { privacyGradeForModel, filterModelsByZdr } from './lib/privacy';
+import { getMemories, addMemory, removeMemory, prependMemoryToMessages } from './lib/memory';
+import { purchaseTopupAndCredit } from './lib/iap';
+
 
 const DEFAULT_MODEL = 'anthropic/claude-sonnet-5';
 
@@ -75,11 +91,40 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const listRef = useRef(null);
 
+  // Item 13: model picker simplification state.
+  const [browseAllVisible, setBrowseAllVisible] = useState(false);
+  const [modelSearch, setModelSearch] = useState('');
+  const [usageCounts, setUsageCounts] = useState({});
+
+  // Item 9: preference-based model ranking, persisted locally.
+  const [modelPrefs, setModelPrefs] = useState({ costPriority: null, privacyPriority: null });
+
+  // Item 10: ZDR (zero data retention) enforcement toggle.
+  const [zdrEnabled, setZdrEnabled] = useState(false);
+
+  // Item 3: dedicated Settings screen.
+  const [settingsVisible, setSettingsVisible] = useState(false);
+
+  // Item 5: local-only memory entries, injected into every new chat.
+  const [memories, setMemories] = useState([]);
+  const [memoryInput, setMemoryInput] = useState('');
+
+  // Item 12: IAP top-up purchase in progress.
+  const [purchasing, setPurchasing] = useState(false);
+
   useEffect(() => {
     (async () => {
       const stored = await getStoredKey();
       if (stored) setApiKey(stored);
       setCheckingSession(false);
+      const [counts, prefs, mem] = await Promise.all([
+        getModelUsageCounts(),
+        getModelPrefs(),
+        getMemories(),
+      ]);
+      setUsageCounts(counts);
+      setModelPrefs(prefs);
+      setMemories(mem);
     })();
   }, []);
 
@@ -218,14 +263,19 @@ export default function App() {
         refreshAnonStatus(anonDeviceId);
       } else if (compareMode && compareModels.length >= 2) {
         const modelInfoById = Object.fromEntries(models.map((m) => [m.id, m]));
-        const results = await sendChatMulti(apiKey, compareModels, toApiMessages(nextMessages), modelInfoById);
+        const apiMessages = prependMemoryToMessages(toApiMessages(nextMessages), memories);
+        const results = await sendChatMulti(apiKey, compareModels, apiMessages, modelInfoById, { zdr: zdrEnabled });
         setMessages((prev) => [
           ...prev,
           { id: Date.now() + '-cmp', role: 'compare', results },
         ]);
+        compareModels.forEach(recordModelUsage);
       } else {
-        const reply = await sendChat(apiKey, selectedModel, toApiMessages(nextMessages));
+        const apiMessages = prependMemoryToMessages(toApiMessages(nextMessages), memories);
+        const reply = await sendChat(apiKey, selectedModel, apiMessages, { zdr: zdrEnabled });
         setMessages((prev) => [...prev, { id: Date.now() + '-a', role: 'assistant', content: reply }]);
+        recordModelUsage(selectedModel);
+        getModelUsageCounts().then(setUsageCounts);
       }
     } catch (e) {
       if (isAnon && e.status === 402) {
@@ -243,7 +293,39 @@ export default function App() {
       setSending(false);
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 100);
     }
-  }, [input, attachments, sending, messages, apiKey, selectedModel, compareMode, compareModels, isAnon, anonDeviceId, anonStatus, refreshAnonStatus]);
+  }, [input, attachments, sending, messages, apiKey, selectedModel, compareMode, compareModels, isAnon, anonDeviceId, anonStatus, refreshAnonStatus, memories, zdrEnabled, models]);
+
+  const handleSaveModelPrefs = useCallback(async (next) => {
+    setModelPrefs(next);
+    await saveModelPrefs(next);
+  }, []);
+
+  const handleAddMemory = useCallback(async () => {
+    const text = memoryInput.trim();
+    if (!text) return;
+    const next = await addMemory(text);
+    setMemories(next);
+    setMemoryInput('');
+  }, [memoryInput]);
+
+  const handleRemoveMemory = useCallback(async (id) => {
+    const next = await removeMemory(id);
+    setMemories(next);
+  }, []);
+
+  const handleBuyTopup = useCallback(async () => {
+    if (!anonDeviceId) return;
+    setPurchasing(true);
+    try {
+      const status = await purchaseTopupAndCredit(anonDeviceId);
+      setAnonStatus(status);
+    } catch (e) {
+      Alert.alert('Purchase failed', e.message || 'Could not complete the purchase.');
+    } finally {
+      setPurchasing(false);
+    }
+  }, [anonDeviceId]);
+
 
   const handleToggleCompareModel = useCallback((modelId) => {
     setCompareModels((prev) => toggleModelSelection(prev, modelId, COMPARE_MODEL_CAP));
@@ -337,6 +419,9 @@ export default function App() {
               </Text>
             </TouchableOpacity>
           )}
+          <TouchableOpacity onPress={() => setSettingsVisible(true)}>
+            <Text style={styles.settingsGear}>⚙︎</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={handleLogout}>
             <Text style={styles.logoutText}>Sign out</Text>
           </TouchableOpacity>
@@ -442,31 +527,80 @@ export default function App() {
         </View>
       </KeyboardAvoidingView>
 
-      <Modal visible={pickerVisible} animationType="slide" transparent onRequestClose={() => setPickerVisible(false)}>
-        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setPickerVisible(false)}>
+      <Modal visible={pickerVisible} animationType="slide" transparent onRequestClose={() => { setPickerVisible(false); setBrowseAllVisible(false); setModelSearch(''); }}>
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => { setPickerVisible(false); setBrowseAllVisible(false); setModelSearch(''); }}>
           <View style={styles.modalSheet}>
-            <Text style={styles.modalTitle}>Choose a model</Text>
-            <FlatList
-              data={
-                filterModelsForAttachments(models, attachments).length
-                  ? filterModelsForAttachments(models, attachments)
-                  : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }]
+            <Text style={styles.modalTitle}>{browseAllVisible ? 'All models' : 'Choose a model'}</Text>
+            {browseAllVisible && (
+              <TextInput
+                style={styles.codeInput}
+                placeholder="Search models..."
+                placeholderTextColor="#666"
+                value={modelSearch}
+                onChangeText={setModelSearch}
+              />
+            )}
+            {(() => {
+              const base = rankModelsByPreference(
+                filterModelsByZdr(
+                  filterModelsForAttachments(models, attachments).length
+                    ? filterModelsForAttachments(models, attachments)
+                    : [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL }],
+                  zdrEnabled
+                ),
+                modelPrefs
+              );
+              if (!browseAllVisible) {
+                const shortlist = buildShortlist(base, usageCounts, FLAGSHIP_MODEL_IDS);
+                return (
+                  <>
+                    <FlatList
+                      data={shortlist.length ? shortlist : base}
+                      keyExtractor={(m) => m.id}
+                      renderItem={({ item }) => (
+                        <TouchableOpacity
+                          style={styles.modelRow}
+                          onPress={() => { setSelectedModel(item.id); setPickerVisible(false); }}
+                        >
+                          <Text style={styles.modelRowText}>{item.name || item.id}</Text>
+                          {privacyGradeForModel(item.id) === 'A' && <Text style={styles.privacyBadge}>🔒A</Text>}
+                          {item.id === selectedModel && <Text style={styles.checkmark}>✓</Text>}
+                        </TouchableOpacity>
+                      )}
+                      style={{ maxHeight: 360 }}
+                    />
+                    <TouchableOpacity style={styles.browseAllLink} onPress={() => setBrowseAllVisible(true)}>
+                      <Text style={styles.browseAllLinkText}>Browse all models ({base.length})</Text>
+                    </TouchableOpacity>
+                  </>
+                );
               }
-              keyExtractor={(m) => m.id}
-              renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={styles.modelRow}
-                  onPress={() => {
-                    setSelectedModel(item.id);
-                    setPickerVisible(false);
-                  }}
-                >
-                  <Text style={styles.modelRowText}>{item.name || item.id}</Text>
-                  {item.id === selectedModel && <Text style={styles.checkmark}>✓</Text>}
-                </TouchableOpacity>
-              )}
-              style={{ maxHeight: 400 }}
-            />
+              const searched = filterModelsBySearch(base, modelSearch);
+              const grouped = groupModelsByProvider(searched);
+              return (
+                <FlatList
+                  data={grouped}
+                  keyExtractor={(g) => g.provider}
+                  renderItem={({ item: group }) => (
+                    <View>
+                      <Text style={styles.providerHeader}>{group.provider}</Text>
+                      {group.models.map((m) => (
+                        <TouchableOpacity
+                          key={m.id}
+                          style={styles.modelRow}
+                          onPress={() => { setSelectedModel(m.id); setPickerVisible(false); setBrowseAllVisible(false); setModelSearch(''); }}
+                        >
+                          <Text style={styles.modelRowText}>{m.name || m.id}</Text>
+                          {privacyGradeForModel(m.id) === 'A' && <Text style={styles.privacyBadge}>🔒A</Text>}
+                          {m.id === selectedModel && <Text style={styles.checkmark}>✓</Text>}
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  )}
+                  style={{ maxHeight: 400 }}
+                />
+              );
+            })()}
           </View>
         </TouchableOpacity>
       </Modal>
@@ -515,6 +649,80 @@ export default function App() {
               </Text>
             </TouchableOpacity>
           </View>
+        </TouchableOpacity>
+      </Modal>
+
+      <Modal visible={settingsVisible} animationType="slide" transparent onRequestClose={() => setSettingsVisible(false)}>
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setSettingsVisible(false)}>
+          <ScrollView style={styles.modalSheet} contentContainerStyle={{ paddingBottom: 24 }}>
+            <Text style={styles.modalTitle}>Settings</Text>
+
+            <Text style={styles.settingsSectionTitle}>Model preferences</Text>
+            <View style={styles.prefRow}>
+              {['cheap', 'flagship'].map((opt) => (
+                <TouchableOpacity
+                  key={opt}
+                  style={[styles.prefChip, modelPrefs.costPriority === opt && styles.prefChipActive]}
+                  onPress={() => handleSaveModelPrefs({ ...modelPrefs, costPriority: modelPrefs.costPriority === opt ? null : opt })}
+                >
+                  <Text style={[styles.prefChipText, modelPrefs.costPriority === opt && styles.prefChipTextActive]}>
+                    {opt === 'cheap' ? 'Prefer cheaper' : 'Prefer flagship'}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <View style={styles.settingsRow}>
+              <Text style={styles.settingsRowLabel}>Zero data retention only</Text>
+              <Switch value={zdrEnabled} onValueChange={setZdrEnabled} />
+            </View>
+            <Text style={styles.settingsHint}>
+              When on, every request only routes to providers that guarantee zero data retention (grade A).
+            </Text>
+
+            {!isAnon && (
+              <>
+                <Text style={styles.settingsSectionTitle}>Memory</Text>
+                <Text style={styles.settingsHint}>Facts the app remembers and includes in every new chat. Stored only on this device.</Text>
+                {memories.map((m) => (
+                  <View key={m.id} style={styles.memoryRow}>
+                    <Text style={styles.memoryRowText}>{m.text}</Text>
+                    <TouchableOpacity onPress={() => handleRemoveMemory(m.id)}>
+                      <Text style={styles.attachmentChipRemove}>✕</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
+                <View style={styles.memoryInputRow}>
+                  <TextInput
+                    style={[styles.codeInput, { flex: 1, marginVertical: 8 }]}
+                    placeholder="e.g. I prefer concise answers"
+                    placeholderTextColor="#666"
+                    value={memoryInput}
+                    onChangeText={setMemoryInput}
+                  />
+                  <TouchableOpacity style={styles.memoryAddButton} onPress={handleAddMemory}>
+                    <Text style={styles.loginButtonText}>Add</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
+            {isAnon && (
+              <>
+                <Text style={styles.settingsSectionTitle}>Free trial</Text>
+                <Text style={styles.settingsHint}>
+                  ${(anonStatus?.remaining_usd ?? 0.5).toFixed(2)} remaining of your lifetime free trial.
+                </Text>
+                <TouchableOpacity style={styles.loginButton} onPress={handleBuyTopup} disabled={purchasing}>
+                  {purchasing ? <ActivityIndicator color="#000" /> : <Text style={styles.loginButtonText}>Buy $3 credit</Text>}
+                </TouchableOpacity>
+              </>
+            )}
+
+            <TouchableOpacity onPress={() => setSettingsVisible(false)} style={{ marginTop: 20 }}>
+              <Text style={[styles.subtitle, { marginBottom: 0, textDecorationLine: 'underline' }]}>Close</Text>
+            </TouchableOpacity>
+          </ScrollView>
         </TouchableOpacity>
       </Modal>
     </SafeAreaView>
@@ -636,4 +844,22 @@ const styles = StyleSheet.create({
   modelRowText: { color: '#fff', fontSize: 15, flex: 1 },
   checkmark: { color: '#2a5cff', fontSize: 16, fontWeight: '700' },
   compareDot: { width: 14, height: 14, borderRadius: 7 },
+  settingsGear: { color: '#8e8e93', fontSize: 18 },
+  privacyBadge: { color: '#34c759', fontSize: 11, fontWeight: '700', marginRight: 8 },
+  browseAllLink: { paddingVertical: 14, alignItems: 'center' },
+  browseAllLinkText: { color: '#2a5cff', fontSize: 14, fontWeight: '600' },
+  providerHeader: { color: '#8e8e93', fontSize: 12, fontWeight: '700', textTransform: 'uppercase', marginTop: 12, marginBottom: 4 },
+  settingsSectionTitle: { color: '#fff', fontSize: 15, fontWeight: '700', marginTop: 16, marginBottom: 8 },
+  settingsHint: { color: '#8e8e93', fontSize: 12, lineHeight: 18, marginBottom: 8 },
+  settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 8 },
+  settingsRowLabel: { color: '#fff', fontSize: 15 },
+  prefRow: { flexDirection: 'row', gap: 8, marginBottom: 4 },
+  prefChip: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 16, borderWidth: 1, borderColor: '#3a3a3c' },
+  prefChipActive: { backgroundColor: '#2a5cff', borderColor: '#2a5cff' },
+  prefChipText: { color: '#8e8e93', fontSize: 13, fontWeight: '600' },
+  prefChipTextActive: { color: '#fff' },
+  memoryRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#2a2a2c' },
+  memoryRowText: { color: '#fff', fontSize: 14, flex: 1, marginRight: 8 },
+  memoryInputRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  memoryAddButton: { backgroundColor: ACCENT, paddingVertical: 10, paddingHorizontal: 16, borderRadius: 14 },
 });
